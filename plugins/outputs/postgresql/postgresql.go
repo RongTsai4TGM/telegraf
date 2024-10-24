@@ -37,6 +37,7 @@ var sampleConfig string
 type Postgresql struct {
 	Connection                 config.Secret           `toml:"connection"`
 	Schema                     string                  `toml:"schema"`
+	WriteMode                  string                  `toml:"write_mode"`
 	TagsAsForeignKeys          bool                    `toml:"tags_as_foreign_keys"`
 	TagTableSuffix             string                  `toml:"tag_table_suffix"`
 	ForeignTagConstraint       bool                    `toml:"foreign_tag_constraint"`
@@ -417,6 +418,13 @@ func (p *Postgresql) writeMetricsFromMeasure(ctx context.Context, db dbh, tableS
 		return err
 	}
 
+	if p.WriteMode == "ignore_duplicate" {
+		if err = p.writeInsertIgnoreDuplicate(ctx, db, tableSource); err != nil {
+			return fmt.Errorf("writing to table (ingore duplicate) %q: %w", tableSource.Name(), err)
+		}
+		return nil
+	}
+	
 	if p.TagsAsForeignKeys {
 		if err = p.writeTagTable(ctx, db, tableSource); err != nil {
 			if p.ForeignTagConstraint {
@@ -430,6 +438,37 @@ func (p *Postgresql) writeMetricsFromMeasure(ctx context.Context, db dbh, tableS
 
 	fullTableName := utils.FullTableName(p.Schema, tableSource.Name())
 	if _, err := db.CopyFrom(ctx, fullTableName, tableSource.ColumnNames(), tableSource); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (p *Postgresql) writeInsertIgnoreDuplicate(ctx context.Context, db dbh, tableSource *TableSource) error {
+	// need a transaction so that if it errors, we don't roll back the parent transaction, just the tags
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // In case of failure during commit, "err" from commit will be returned
+
+	ident := utils.FullTableName(p.Schema, tableSource.Name())
+	identTemp := pgx.Identifier{tableSource.Name() + "_temp"}
+	sql := fmt.Sprintf("CREATE TEMP TABLE %s (LIKE %s) ON COMMIT DROP", identTemp.Sanitize(), ident.Sanitize())
+	if _, err := tx.Exec(ctx, sql); err != nil {
+		return fmt.Errorf("creating %s temp table: %w", ident.Sanitize(), err)
+	}
+
+	if _, err := tx.CopyFrom(ctx, identTemp, tableSource.ColumnNames(), tableSource); err != nil {
+		return fmt.Errorf("copying into %s temp table: %w", ident.Sanitize(), err)
+	}
+
+	insert := fmt.Sprintf("INSERT INTO %s SELECT * FROM %s ORDER BY time ON CONFLICT (time,key) DO NOTHING", ident.Sanitize(), identTemp.Sanitize())
+	if _, err := tx.Exec(ctx, insert); err != nil {
+		return fmt.Errorf("inserting into %s table: %w", ident.Sanitize(), err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
 

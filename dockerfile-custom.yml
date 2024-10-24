@@ -1,0 +1,5 @@
+FROM archlinux 
+
+COPY telegraf /usr/bin/telegraf
+
+CMD ["/usr/bin/telegraf"]
